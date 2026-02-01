@@ -4,7 +4,7 @@ import librosa
 import numpy as np
 import torch
 from neucodec import NeuCodec, DistillNeuCodec
-from vieneu_utils.phonemize_text import phonemize_with_dict
+from vieneu_utils.phonemize_text import phonemize_with_dict, phoneme_dict as base_phoneme_dict
 from vieneu_utils.core_utils import split_text_into_chunks, join_audio_chunks
 from collections import defaultdict
 import re
@@ -465,7 +465,7 @@ class VieNeuTTS:
             ref_codes = self.codec.encode_code(audio_or_path=wav_tensor).squeeze(0).squeeze(0)
         return ref_codes
 
-    def infer(self, text: str, ref_audio: str | Path = None, ref_codes: np.ndarray | torch.Tensor = None, ref_text: str = None, max_chars: int = 256, silence_p: float = 0.15, crossfade_p: float = 0.0, voice: dict = None, temperature: float = 1.0, top_k: int = 50) -> np.ndarray:
+    def infer(self, text: str, ref_audio: str | Path = None, ref_codes: np.ndarray | torch.Tensor = None, ref_text: str = None, max_chars: int = 256, silence_p: float = 0.15, crossfade_p: float = 0.0, voice: dict = None, temperature: float = 1.0, top_k: int = 50, phoneme_dict: dict | None = None) -> np.ndarray:
         """
         Perform inference to generate speech from text using the TTS model and reference audio.
         Automatically splits long text into chunks.
@@ -481,9 +481,11 @@ class VieNeuTTS:
             voice (dict): Optional dictionary containing 'codes' and 'text' (overrides ref_codes/ref_text).
             temperature (float): Sampling temperature (default 1.0).
             top_k (int): Top-k sampling (default 50).
+            phoneme_dict (dict | None): Optional runtime terminology (word -> phoneme). Merged with base dict.
         Returns:
             np.ndarray: Generated speech waveform.
         """
+        pd = {**base_phoneme_dict, **phoneme_dict} if phoneme_dict else base_phoneme_dict
         if voice is not None:
             ref_codes = voice.get('codes', ref_codes)
             ref_text = voice.get('text', ref_text)
@@ -515,9 +517,9 @@ class VieNeuTTS:
         for chunk in chunks:
             # Generate tokens
             if self._is_quantized_model:
-                output_str = self._infer_ggml(ref_codes, ref_text, chunk, temperature, top_k)
+                output_str = self._infer_ggml(ref_codes, ref_text, chunk, temperature, top_k, phoneme_dict=pd)
             else:
-                prompt_ids = self._apply_chat_template(ref_codes, ref_text, chunk)
+                prompt_ids = self._apply_chat_template(ref_codes, ref_text, chunk, phoneme_dict=pd)
                 output_str = self._infer_torch(prompt_ids, temperature, top_k)
 
             # Decode
@@ -533,7 +535,7 @@ class VieNeuTTS:
 
         return final_wav
 
-    def infer_stream(self, text: str, ref_codes: np.ndarray | torch.Tensor = None, ref_text: str = None, max_chars: int = 256, voice: dict = None, temperature: float = 1.0, top_k: int = 50) -> Generator[np.ndarray, None, None]:
+    def infer_stream(self, text: str, ref_codes: np.ndarray | torch.Tensor = None, ref_text: str = None, max_chars: int = 256, voice: dict = None, temperature: float = 1.0, top_k: int = 50, phoneme_dict: dict | None = None) -> Generator[np.ndarray, None, None]:
         """
         Perform streaming inference to generate speech from text using the TTS model and reference audio.
         Automatically splits long text into chunks and streams them.
@@ -546,9 +548,11 @@ class VieNeuTTS:
             voice (dict): Optional dictionary containing 'codes' and 'text'.
             temperature (float): Sampling temperature.
             top_k (int): Top-k sampling.
+            phoneme_dict (dict | None): Optional runtime terminology (word -> phoneme). Merged with base dict.
         Yields:
             np.ndarray: Generated speech waveform.
         """
+        pd = {**base_phoneme_dict, **phoneme_dict} if phoneme_dict else base_phoneme_dict
         if voice is not None:
             ref_codes = voice.get('codes', ref_codes)
             ref_text = voice.get('text', ref_text)
@@ -569,10 +573,10 @@ class VieNeuTTS:
         
         for chunk in chunks:
             if self._is_quantized_model:
-                yield from self._infer_stream_ggml(ref_codes, ref_text, chunk, temperature, top_k)
+                yield from self._infer_stream_ggml(ref_codes, ref_text, chunk, temperature, top_k, phoneme_dict=pd)
             else:
                 # Fallback for torch backend (no internal streaming, but can stream by chunks)
-                prompt_ids = self._apply_chat_template(ref_codes, ref_text, chunk)
+                prompt_ids = self._apply_chat_template(ref_codes, ref_text, chunk, phoneme_dict=pd)
                 output_str = self._infer_torch(prompt_ids, temperature, top_k)
                 wav = self._decode(output_str)
                 if self.watermarker:
@@ -603,8 +607,9 @@ class VieNeuTTS:
         
         return recon[0, 0, :]
     
-    def _apply_chat_template(self, ref_codes: list[int], ref_text: str, input_text: str) -> list[int]:
-        input_text = phonemize_with_dict(ref_text) + " " + phonemize_with_dict(input_text)
+    def _apply_chat_template(self, ref_codes: list[int], ref_text: str, input_text: str, phoneme_dict: dict | None = None) -> list[int]:
+        pd = phoneme_dict if phoneme_dict is not None else base_phoneme_dict
+        input_text = phonemize_with_dict(ref_text, pd) + " " + phonemize_with_dict(input_text, pd)
 
         speech_replace = self.tokenizer.convert_tokens_to_ids("<|SPEECH_REPLACE|>")
         speech_gen_start = self.tokenizer.convert_tokens_to_ids("<|SPEECH_GENERATION_START|>")
@@ -652,9 +657,10 @@ class VieNeuTTS:
         )
         return output_str
 
-    def _infer_ggml(self, ref_codes: list[int], ref_text: str, input_text: str, temperature: float = 1.0, top_k: int = 50) -> str:
-        ref_text = phonemize_with_dict(ref_text)
-        input_text = phonemize_with_dict(input_text)
+    def _infer_ggml(self, ref_codes: list[int], ref_text: str, input_text: str, temperature: float = 1.0, top_k: int = 50, phoneme_dict: dict | None = None) -> str:
+        pd = phoneme_dict if phoneme_dict is not None else base_phoneme_dict
+        ref_text = phonemize_with_dict(ref_text, pd)
+        input_text = phonemize_with_dict(input_text, pd)
 
         codes_str = "".join([f"<|speech_{idx}|>" for idx in ref_codes])
         prompt = (
@@ -671,9 +677,10 @@ class VieNeuTTS:
         output_str = output["choices"][0]["text"]
         return output_str
 
-    def _infer_stream_ggml(self, ref_codes: torch.Tensor, ref_text: str, input_text: str, temperature: float = 1.0, top_k: int = 50) -> Generator[np.ndarray, None, None]:
-        ref_text = phonemize_with_dict(ref_text)
-        input_text = phonemize_with_dict(input_text)
+    def _infer_stream_ggml(self, ref_codes: torch.Tensor, ref_text: str, input_text: str, temperature: float = 1.0, top_k: int = 50, phoneme_dict: dict | None = None) -> Generator[np.ndarray, None, None]:
+        pd = phoneme_dict if phoneme_dict is not None else base_phoneme_dict
+        ref_text = phonemize_with_dict(ref_text, pd)
+        input_text = phonemize_with_dict(input_text, pd)
 
         codes_str = "".join([f"<|speech_{idx}|>" for idx in ref_codes])
         prompt = (
@@ -1129,10 +1136,11 @@ class FastVieNeuTTS:
         
         return recon[0, 0, :]
     
-    def _format_prompt(self, ref_codes: list[int], ref_text: str, input_text: str) -> str:
+    def _format_prompt(self, ref_codes: list[int], ref_text: str, input_text: str, phoneme_dict: dict | None = None) -> str:
         """Format prompt for LMDeploy"""
-        ref_text_phones = phonemize_with_dict(ref_text)
-        input_text_phones = phonemize_with_dict(input_text)
+        pd = phoneme_dict if phoneme_dict is not None else base_phoneme_dict
+        ref_text_phones = phonemize_with_dict(ref_text, pd)
+        input_text_phones = phonemize_with_dict(input_text, pd)
         
         codes_str = "".join([f"<|speech_{idx}|>" for idx in ref_codes])
         
@@ -1143,7 +1151,7 @@ class FastVieNeuTTS:
         
         return prompt
     
-    def infer(self, text: str, ref_audio: str | Path = None, ref_codes: np.ndarray | torch.Tensor = None, ref_text: str = None, max_chars: int = 256, silence_p: float = 0.15, crossfade_p: float = 0.0, voice: dict = None, temperature: float = 1.0, top_k: int = 50) -> np.ndarray:
+    def infer(self, text: str, ref_audio: str | Path = None, ref_codes: np.ndarray | torch.Tensor = None, ref_text: str = None, max_chars: int = 256, silence_p: float = 0.15, crossfade_p: float = 0.0, voice: dict = None, temperature: float = 1.0, top_k: int = 50, phoneme_dict: dict | None = None) -> np.ndarray:
         """
         Single inference (automatically splits long text and uses batching for speed).
         
@@ -1156,6 +1164,7 @@ class FastVieNeuTTS:
             voice: Optional dict with 'codes' and 'text'.
             temperature: Sampling temperature.
             top_k: Top-k sampling.
+            phoneme_dict: Optional runtime terminology (word -> phoneme). Merged with base dict.
             
         Returns:
             Generated speech waveform as numpy array
@@ -1190,6 +1199,7 @@ class FastVieNeuTTS:
         if not chunks:
             return np.array([], dtype=np.float32)
             
+        pd = {**base_phoneme_dict, **phoneme_dict} if phoneme_dict else base_phoneme_dict
         if len(chunks) == 1:
             # Single chunk optimization
             if isinstance(ref_codes, torch.Tensor):
@@ -1197,12 +1207,12 @@ class FastVieNeuTTS:
             if isinstance(ref_codes, np.ndarray):
                 ref_codes = ref_codes.flatten().tolist()
             
-            prompt = self._format_prompt(ref_codes, ref_text, chunks[0])
+            prompt = self._format_prompt(ref_codes, ref_text, chunks[0], phoneme_dict=pd)
             responses = self.backbone([prompt], gen_config=self.gen_config, do_preprocess=False)
             wav = self._decode(responses[0].text)
         else:
             # Multiple chunks: use batching for parallel generation
-            all_wavs = self.infer_batch(chunks, ref_codes, ref_text, voice=voice, temperature=temperature, top_k=top_k)
+            all_wavs = self.infer_batch(chunks, ref_codes, ref_text, voice=voice, temperature=temperature, top_k=top_k, phoneme_dict=phoneme_dict)
             wav = join_audio_chunks(all_wavs, self.sample_rate, silence_p, crossfade_p)
 
         # Apply watermark if available
@@ -1211,13 +1221,14 @@ class FastVieNeuTTS:
             
         return wav
     
-    def infer_batch(self, texts: list[str], ref_codes: np.ndarray | torch.Tensor = None, ref_text: str = None, max_batch_size: int = None, voice: dict = None, temperature: float = 1.0, top_k: int = 50) -> list[np.ndarray]:
+    def infer_batch(self, texts: list[str], ref_codes: np.ndarray | torch.Tensor = None, ref_text: str = None, max_batch_size: int = None, voice: dict = None, temperature: float = 1.0, top_k: int = 50, phoneme_dict: dict | None = None) -> list[np.ndarray]:
         """
         Batch inference for multiple texts.
         """
         if max_batch_size is None:
             max_batch_size = self.max_batch_size
 
+        pd = {**base_phoneme_dict, **phoneme_dict} if phoneme_dict else base_phoneme_dict
         if voice is not None:
             ref_codes = voice.get('codes', ref_codes)
             ref_text = voice.get('text', ref_text)
@@ -1250,7 +1261,7 @@ class FastVieNeuTTS:
         
         for i in range(0, len(texts), max_batch_size):
             batch_texts = texts[i:i+max_batch_size]
-            prompts = [self._format_prompt(ref_codes, ref_text, text) for text in batch_texts]
+            prompts = [self._format_prompt(ref_codes, ref_text, text, phoneme_dict=pd) for text in batch_texts]
             responses = self.backbone(prompts, gen_config=self.gen_config, do_preprocess=False)
             batch_codes = [response.text for response in responses]
             
@@ -1269,7 +1280,7 @@ class FastVieNeuTTS:
         
         return all_wavs
     
-    def infer_stream(self, text: str, ref_codes: np.ndarray | torch.Tensor = None, ref_text: str = None, max_chars: int = 256, voice: dict = None, temperature: float = 1.0, top_k: int = 50) -> Generator[np.ndarray, None, None]:
+    def infer_stream(self, text: str, ref_codes: np.ndarray | torch.Tensor = None, ref_text: str = None, max_chars: int = 256, voice: dict = None, temperature: float = 1.0, top_k: int = 50, phoneme_dict: dict | None = None) -> Generator[np.ndarray, None, None]:
         """
         Streaming inference with low latency (supports long text by splitting into chunks).
         
@@ -1281,10 +1292,12 @@ class FastVieNeuTTS:
             voice: Optional dict with 'codes' and 'text'.
             temperature: Sampling temperature.
             top_k: Top-k sampling.
+            phoneme_dict: Optional runtime terminology (word -> phoneme). Merged with base dict.
             
         Yields:
             Audio chunks as numpy arrays
         """
+        pd = {**base_phoneme_dict, **phoneme_dict} if phoneme_dict else base_phoneme_dict
         if voice is not None:
             ref_codes = voice.get('codes', ref_codes)
             ref_text = voice.get('text', ref_text)
@@ -1308,16 +1321,16 @@ class FastVieNeuTTS:
         chunks = split_text_into_chunks(text, max_chars=max_chars)
         
         for chunk in chunks:
-            yield from self._infer_stream_single(chunk, ref_codes, ref_text)
+            yield from self._infer_stream_single(chunk, ref_codes, ref_text, phoneme_dict=pd)
 
-    def _infer_stream_single(self, text: str, ref_codes: np.ndarray | torch.Tensor, ref_text: str) -> Generator[np.ndarray, None, None]:
+    def _infer_stream_single(self, text: str, ref_codes: np.ndarray | torch.Tensor, ref_text: str, phoneme_dict: dict | None = None) -> Generator[np.ndarray, None, None]:
         """Internal method for streaming a single short text chunk"""
         if isinstance(ref_codes, torch.Tensor):
             ref_codes = ref_codes.cpu().numpy()
         if isinstance(ref_codes, np.ndarray):
             ref_codes = ref_codes.flatten().tolist()
         
-        prompt = self._format_prompt(ref_codes, ref_text, text)
+        prompt = self._format_prompt(ref_codes, ref_text, text, phoneme_dict=phoneme_dict)
         
         audio_cache = []
         token_cache = [f"<|speech_{idx}|>" for idx in ref_codes]
@@ -1469,10 +1482,11 @@ class RemoteVieNeuTTS(VieNeuTTS):
     def _load_backbone(self, backbone_repo, backbone_device):
         pass 
 
-    def _format_prompt(self, ref_codes: list[int], ref_text: str, input_text: str) -> str:
+    def _format_prompt(self, ref_codes: list[int], ref_text: str, input_text: str, phoneme_dict: dict | None = None) -> str:
         """Format prompt for remote LMDeploy server"""
-        ref_text_phones = phonemize_with_dict(ref_text)
-        input_text_phones = phonemize_with_dict(input_text)
+        pd = phoneme_dict if phoneme_dict is not None else base_phoneme_dict
+        ref_text_phones = phonemize_with_dict(ref_text, pd)
+        input_text_phones = phonemize_with_dict(input_text, pd)
         
         codes_str = "".join([f"<|speech_{idx}|>" for idx in ref_codes])
         
@@ -1482,7 +1496,7 @@ class RemoteVieNeuTTS(VieNeuTTS):
         )
         return prompt
 
-    def infer(self, text: str, ref_audio: str | Path = None, ref_codes: np.ndarray | torch.Tensor = None, ref_text: str = None, max_chars: int = 256, silence_p: float = 0.15, crossfade_p: float = 0.0, voice: dict = None, temperature: float = 1.0, top_k: int = 50) -> np.ndarray:
+    def infer(self, text: str, ref_audio: str | Path = None, ref_codes: np.ndarray | torch.Tensor = None, ref_text: str = None, max_chars: int = 256, silence_p: float = 0.15, crossfade_p: float = 0.0, voice: dict = None, temperature: float = 1.0, top_k: int = 50, phoneme_dict: dict | None = None) -> np.ndarray:
         """
         Remote inference (automatically splits long text).
         
@@ -1526,6 +1540,7 @@ class RemoteVieNeuTTS(VieNeuTTS):
         if not chunks:
             return np.array([], dtype=np.float32)
 
+        pd = {**base_phoneme_dict, **phoneme_dict} if phoneme_dict else base_phoneme_dict
         all_wavs = []
         for chunk in chunks:
             if isinstance(ref_codes, torch.Tensor):
@@ -1535,7 +1550,7 @@ class RemoteVieNeuTTS(VieNeuTTS):
             else:
                 ref_codes_list = ref_codes
 
-            prompt = self._format_prompt(ref_codes_list, ref_text, chunk)
+            prompt = self._format_prompt(ref_codes_list, ref_text, chunk, phoneme_dict=pd)
             
             payload = {
                 "model": self.model_name,
@@ -1570,10 +1585,11 @@ class RemoteVieNeuTTS(VieNeuTTS):
             
         return final_wav    
 
-    def infer_stream(self, text: str, ref_audio: str | Path = None, ref_codes: np.ndarray | torch.Tensor = None, ref_text: str = None, max_chars: int = 256, voice: dict = None, temperature: float = 1.0, top_k: int = 50) -> Generator[np.ndarray, None, None]:
+    def infer_stream(self, text: str, ref_audio: str | Path = None, ref_codes: np.ndarray | torch.Tensor = None, ref_text: str = None, max_chars: int = 256, voice: dict = None, temperature: float = 1.0, top_k: int = 50, phoneme_dict: dict | None = None) -> Generator[np.ndarray, None, None]:
         """
         Stream output audio (generator).
         """
+        pd = {**base_phoneme_dict, **phoneme_dict} if phoneme_dict else base_phoneme_dict
         if voice is not None:
             ref_codes = voice.get('codes', ref_codes)
             ref_text = voice.get('text', ref_text)
@@ -1594,9 +1610,9 @@ class RemoteVieNeuTTS(VieNeuTTS):
 
         chunks = split_text_into_chunks(text, max_chars=max_chars)
         for chunk in chunks:
-            yield from self._infer_stream_chunk(chunk, ref_codes, ref_text, temperature, top_k)
+            yield from self._infer_stream_chunk(chunk, ref_codes, ref_text, temperature, top_k, phoneme_dict=pd)
 
-    def _infer_stream_chunk(self, chunk, ref_codes, ref_text, temperature, top_k):
+    def _infer_stream_chunk(self, chunk, ref_codes, ref_text, temperature, top_k, phoneme_dict: dict | None = None):
         """Internal helper to stream a single text chunk"""
         if isinstance(ref_codes, torch.Tensor):
             ref_codes_list = ref_codes.cpu().numpy().flatten().tolist()
@@ -1605,7 +1621,7 @@ class RemoteVieNeuTTS(VieNeuTTS):
         else:
             ref_codes_list = ref_codes
 
-        prompt = self._format_prompt(ref_codes_list, ref_text, chunk)
+        prompt = self._format_prompt(ref_codes_list, ref_text, chunk, phoneme_dict=phoneme_dict)
         
         payload = {
             "model": self.model_name,

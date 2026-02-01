@@ -598,9 +598,32 @@ def load_model(backbone_choice: str, codec_choice: str, device_choice: str,
 
 # --- 2. DATA & HELPERS ---
 
+def _parse_terminology(text: str) -> dict:
+    """Parse terminology text (từ=phoneme per line) into dict. Runtime only."""
+    if not text or not text.strip():
+        return {}
+    result = {}
+    for line in text.strip().splitlines():
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        if '=' in line:
+            word, phoneme = line.split('=', 1)
+        elif '\t' in line:
+            word, phoneme = line.split('\t', 1)
+        else:
+            continue
+        word = word.strip()
+        phoneme = phoneme.strip()
+        if word:
+            result[word] = phoneme
+    return result
+
+
 def synthesize_speech(text: str, voice_choice: str, custom_audio, custom_text: str, 
                       mode_tab: str, generation_mode: str, use_batch: bool, max_batch_size_run: int,
-                      temperature: float, max_chars_chunk: int, output_file_name: Optional[str] = None):
+                      temperature: float, max_chars_chunk: int, output_file_name: Optional[str] = None,
+                      terminology_text: str = ""):
     """Synthesis with optimization support and max batch size control"""
     global tts, current_backbone, current_codec, model_loaded, using_lmdeploy
     
@@ -613,6 +636,7 @@ def synthesize_speech(text: str, voice_choice: str, custom_audio, custom_text: s
         return
     
     raw_text = text.strip()
+    phoneme_dict = _parse_terminology(terminology_text) if terminology_text else None
     
     codec_config = CODEC_CONFIGS[current_codec]
     use_preencoded = codec_config['use_preencoded']
@@ -690,7 +714,8 @@ def synthesize_speech(text: str, voice_choice: str, custom_audio, custom_text: s
                     ref_codes=ref_codes, 
                     ref_text=ref_text_raw,
                     max_batch_size=max_batch_size_run,
-                    temperature=temperature
+                    temperature=temperature,
+                    phoneme_dict=phoneme_dict
                 )
                 
                 for chunk_wav in chunk_wavs:
@@ -706,7 +731,8 @@ def synthesize_speech(text: str, voice_choice: str, custom_audio, custom_text: s
                         chunk, 
                         ref_codes=ref_codes, 
                         ref_text=ref_text_raw,
-                        temperature=temperature
+                        temperature=temperature,
+                        phoneme_dict=phoneme_dict
                     )
                     
                     if chunk_wav is not None and len(chunk_wav) > 0:
@@ -779,7 +805,8 @@ def synthesize_speech(text: str, voice_choice: str, custom_audio, custom_text: s
                         chunk_text, 
                         ref_codes=ref_codes, 
                         ref_text=ref_text_raw,
-                        temperature=temperature
+                        temperature=temperature,
+                        phoneme_dict=phoneme_dict
                     )
                     
                     for part_idx, audio_part in enumerate(stream_gen):
@@ -1174,6 +1201,14 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
                         info="Số lượng đoạn văn bản xử lý cùng lúc. Giá trị cao = nhanh hơn nhưng tốn VRAM hơn. Giảm xuống nếu gặp lỗi Out of Memory."
                     )
                 
+                with gr.Accordion("📖 Thuật ngữ (Runtime)", open=False):
+                    terminology_text = gr.Textbox(
+                        label="Định nghĩa phát âm tùy chỉnh",
+                        placeholder="Mỗi dòng: từ=phoneme (IPA)\nVí dụ:\nAI=ˈeɪˈaɪ\nGPT=ʤˈiːpˈiːtˈiː",
+                        lines=4,
+                        info="Chỉ áp dụng trong phiên làm việc hiện tại, không lưu lại. Dùng = hoặc Tab để phân tách."
+                    )
+                
                 with gr.Accordion("⚙️ Cài đặt nâng cao (Generation)", open=False):
                     with gr.Row():
                         temperature_slider = gr.Slider(
@@ -1289,7 +1324,8 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
             fn=synthesize_speech,
             inputs=[text_input, voice_select, custom_audio, custom_text, current_mode_state, 
                     generation_mode, use_batch, max_batch_size_run,
-                    temperature_slider, max_chars_chunk_slider, output_file_name_input],
+                    temperature_slider, max_chars_chunk_slider, output_file_name_input,
+                    terminology_text],
             outputs=[audio_output, status_output]
         )
         
