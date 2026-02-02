@@ -1226,8 +1226,8 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
                 current_mode_state = gr.State("preset_mode")
                 output_file_name_input = gr.Textbox(
                     label="Output File Name",
-                    placeholder="Ví dụ: opm-tt/name.wav (chỉ dùng khi GRADIO_OUTPUT_DIR được set)",
-                    info="Cho phép subfolder; nếu trùng tên sẽ tự thêm hậu tố thời gian.",
+                    placeholder="Ví dụ: subfolder/name.wav (chỉ dùng khi GRADIO_OUTPUT_DIR được set)",
+                    info="Cho phép subfolder.",
                 )
                 
                 with gr.Row():
