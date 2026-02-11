@@ -49,6 +49,8 @@ VieNeu-TTS delivers production-ready speech synthesis fully offline.
 ---
 
 ## 🦜 1. Installation & Web UI <a name="installation"></a>
+> **Intel Arc GPU installation (Optional):** Using PyTorch 2.11 with XPU support. Read the Intel Arc GPU section below. Tested on Arc B580 and A770 on window.
+> Recommend setting: Intel arc have high memory bandwidth so keep the batch size as high as possible and minimize the number of character per chunk.
 
 > ⚡ **Quick Start**  
 > ℹ️ This is the fastest way to get started.  
@@ -115,6 +117,18 @@ VieNeu-TTS delivers production-ready speech synthesis fully offline.
    uv run gradio_app.py
    ```
    Access the UI at `http://127.0.0.1:7860`.
+
+### Installation for Intel Arc GPU: 
+1. **Clone the Repo:**
+   ```bash
+   git clone https://github.com/pnnbao97/VieNeu-TTS.git
+   cd VieNeu-TTS
+   ```
+2. **Environment and dependencies setup with `uv` (Recommended):**
+  - run setup_xpu_uv.bat
+3. **Start the Web UI:**
+  - run run_xpu.bat
+  Access the UI at `http://127.0.0.1:7860`.
 
 ### ⚡ Real-time Streaming (CPU Optimized)
 VieNeu-TTS supports **ultra-low latency streaming**, allowing audio playback to start before the entire sentence is finished. This is specifically optimized for **CPU-only** devices using the GGUF backend.
@@ -333,7 +347,7 @@ Check [docs/Deploy.md](docs/Deploy.md) for more details.
 
 - **Hugging Face:** [pnnbao-ump](https://huggingface.co/pnnbao-ump)
 - **Discord:** [Join our community](https://discord.gg/yJt8kzjzWZ)
-- **Facebook:** [Pham Nguyen Ngoc Bao](https://www.facebook.com/bao.phamnguyenngoc.5)
+- **Facebook:** [Pham Nguyen Ngoc Bao](https://www.facebook.com/pnnbao97)
 - **Licensing:** 
   - **VieNeu-TTS (0.5B):** Apache 2.0 (Free to use).
   - **VieNeu-TTS-0.3B:** CC BY-NC 4.0 (Non-commercial).
