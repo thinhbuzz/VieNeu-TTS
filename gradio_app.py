@@ -139,11 +139,16 @@ def cleanup_gpu_memory():
         torch.mps.empty_cache()
     gc.collect()
 
-def copy_output_if_configured(src_path: str, output_file_name: Optional[str] = None) -> Optional[str]:
-    """Copy output wav to GRADIO_OUTPUT_DIR if configured."""
+def copy_output_if_configured(
+    src_path: str,
+    output_file_name: Optional[str] = None,
+    required_ext: str = ".wav",
+) -> Optional[str]:
+    """Copy output file to GRADIO_OUTPUT_DIR if configured."""
     output_dir = os.getenv("GRADIO_OUTPUT_DIR")
     if not output_dir:
         return None
+    required_ext = required_ext.lower()
     output_dir = os.path.expanduser(output_dir)
     os.makedirs(output_dir, exist_ok=True)
 
@@ -156,9 +161,9 @@ def copy_output_if_configured(src_path: str, output_file_name: Optional[str] = N
             safe_rel = os.path.basename(src_path)
         name, ext = os.path.splitext(os.path.basename(safe_rel))
         if not ext:
-            safe_rel = f"{safe_rel}.wav"
-        elif ext.lower() != ".wav":
-            safe_rel = os.path.join(os.path.dirname(safe_rel), f"{name}.wav")
+            safe_rel = f"{safe_rel}{required_ext}"
+        elif ext.lower() != required_ext:
+            safe_rel = os.path.join(os.path.dirname(safe_rel), f"{name}{required_ext}")
         dest_path = os.path.join(output_dir, safe_rel)
     else:
         base_name = os.path.basename(src_path)
@@ -177,6 +182,67 @@ def copy_output_if_configured(src_path: str, output_file_name: Optional[str] = N
     except Exception as e:
         print(f"⚠️ Không thể copy file output vào GRADIO_OUTPUT_DIR: {e}")
         return None
+
+
+def _format_srt_timestamp(seconds: float) -> str:
+    """Convert seconds to SRT timestamp format HH:MM:SS,mmm."""
+    total_ms = max(0, int(round(seconds * 1000.0)))
+    hours, rem = divmod(total_ms, 3_600_000)
+    minutes, rem = divmod(rem, 60_000)
+    secs, millis = divmod(rem, 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+
+def _build_subtitle_segments(
+    chunks: list[str],
+    chunk_wavs: list[np.ndarray],
+    sr: int,
+    silence_p: float = 0.15,
+    crossfade_p: float = 0.0,
+) -> list[dict]:
+    """Build chunk-level subtitle timing aligned with join_audio_chunks behavior."""
+    if not chunks or not chunk_wavs:
+        return []
+
+    segments = []
+    cursor = 0.0
+    chunk_count = min(len(chunks), len(chunk_wavs))
+    for idx in range(chunk_count):
+        text = chunks[idx].strip()
+        if not text:
+            continue
+
+        curr_duration = len(chunk_wavs[idx]) / float(sr)
+        start = max(0.0, cursor)
+        end = max(start, start + curr_duration)
+        segments.append({"start": start, "end": end, "text": text})
+
+        if idx == chunk_count - 1:
+            continue
+
+        next_duration = len(chunk_wavs[idx + 1]) / float(sr)
+        if silence_p > 0:
+            cursor = end + silence_p
+        elif crossfade_p > 0:
+            overlap = min(crossfade_p, curr_duration, next_duration)
+            cursor = end - overlap
+        else:
+            cursor = end
+
+    return segments
+
+
+def _write_srt_file(srt_path: str, segments: list[dict]):
+    """Write subtitle segments to .srt file."""
+    srt_parent = os.path.dirname(srt_path)
+    if srt_parent:
+        os.makedirs(srt_parent, exist_ok=True)
+
+    with open(srt_path, "w", encoding="utf-8") as f:
+        for idx, seg in enumerate(segments, start=1):
+            start = _format_srt_timestamp(seg["start"])
+            end = _format_srt_timestamp(seg["end"])
+            f.write(f"{idx}\n{start} --> {end}\n{seg['text']}\n\n")
 
 def load_model(backbone_choice: str, codec_choice: str, device_choice: str, 
                force_lmdeploy: bool, custom_model_id: str = "", custom_base_model: str = "", 
@@ -623,7 +689,7 @@ def _parse_terminology(text: str) -> dict:
 def synthesize_speech(text: str, voice_choice: str, custom_audio, custom_text: str, 
                       mode_tab: str, generation_mode: str, use_batch: bool, max_batch_size_run: int,
                       temperature: float, max_chars_chunk: int, output_file_name: Optional[str] = None,
-                      terminology_text: str = ""):
+                      terminology_text: str = "", save_srt: bool = False):
     """Synthesis with optimization support and max batch size control"""
     global tts, current_backbone, current_codec, model_loaded, using_lmdeploy
     
@@ -697,6 +763,7 @@ def synthesize_speech(text: str, voice_choice: str, custom_audio, custom_text: s
         yield None, f"🚀 Bắt đầu tổng hợp {backend_name}{batch_info}{batch_size_info} ({total_chunks} đoạn)..."
         
         all_wavs = []
+        generated_chunks = []
         sr = 24000
         
         start_time = time.time()
@@ -721,6 +788,7 @@ def synthesize_speech(text: str, voice_choice: str, custom_audio, custom_text: s
                 for chunk_wav in chunk_wavs:
                     if chunk_wav is not None and len(chunk_wav) > 0:
                         all_wavs.append(chunk_wav)
+                        generated_chunks.append(text_chunks[len(generated_chunks)])
 
             else:
                 # Sequential processing
@@ -737,6 +805,7 @@ def synthesize_speech(text: str, voice_choice: str, custom_audio, custom_text: s
                     
                     if chunk_wav is not None and len(chunk_wav) > 0:
                         all_wavs.append(chunk_wav)
+                        generated_chunks.append(chunk)
             
             if not all_wavs:
                 yield None, "❌ Không sinh được audio nào."
@@ -749,17 +818,42 @@ def synthesize_speech(text: str, voice_choice: str, custom_audio, custom_text: s
             final_wav = join_audio_chunks(all_wavs, sr=sr, silence_p=0.15)
             
             with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-                sf.write(tmp.name, final_wav, sr)
                 output_path = tmp.name
+            sf.write(output_path, final_wav, sr)
 
-            copy_output_if_configured(output_path, output_file_name=output_file_name)
+            if save_srt:
+                srt_segments = _build_subtitle_segments(
+                    chunks=generated_chunks,
+                    chunk_wavs=all_wavs,
+                    sr=sr,
+                    silence_p=0.15,
+                    crossfade_p=0.0,
+                )
+                if srt_segments:
+                    source_srt = os.path.splitext(output_path)[0] + ".srt"
+                    _write_srt_file(source_srt, srt_segments)
+
+            copy_output_if_configured(
+                output_path,
+                output_file_name=output_file_name,
+                required_ext=".wav",
+            )
+            if save_srt:
+                source_srt = os.path.splitext(output_path)[0] + ".srt"
+                if os.path.exists(source_srt):
+                    copy_output_if_configured(
+                        source_srt,
+                        output_file_name=output_file_name,
+                        required_ext=".srt",
+                    )
             
             process_time = time.time() - start_time
             backend_info = f" (Backend: {'LMDeploy 🚀' if using_lmdeploy else 'Standard 📦'})"
             speed_info = f", Tốc độ: {len(final_wav)/sr/process_time:.2f}x realtime" if process_time > 0 else ""
+            srt_info = " + SRT" if save_srt else ""
             
             
-            yield output_path, f"✅ Hoàn tất! (Thời gian: {process_time:.2f}s{speed_info}){backend_info}"
+            yield output_path, f"✅ Hoàn tất{srt_info}! (Thời gian: {process_time:.2f}s{speed_info}){backend_info}"
             
             # Cleanup memory
             if using_lmdeploy and hasattr(tts, 'cleanup_memory'):
@@ -1229,6 +1323,11 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
                     placeholder="Ví dụ: subfolder/name.wav (chỉ dùng khi GRADIO_OUTPUT_DIR được set)",
                     info="Cho phép subfolder.",
                 )
+                save_srt_checkbox = gr.Checkbox(
+                    value=False,
+                    label="📝 Xuất phụ đề .srt",
+                    info="Lưu file .srt cùng thư mục/tên với file .wav (khác extension)."
+                )
                 
                 with gr.Row():
                     btn_generate = gr.Button("🎵 Bắt đầu", variant="primary", scale=2, interactive=False)
@@ -1325,7 +1424,7 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
             inputs=[text_input, voice_select, custom_audio, custom_text, current_mode_state, 
                     generation_mode, use_batch, max_batch_size_run,
                     temperature_slider, max_chars_chunk_slider, output_file_name_input,
-                    terminology_text],
+                    terminology_text, save_srt_checkbox],
             outputs=[audio_output, status_output]
         )
         

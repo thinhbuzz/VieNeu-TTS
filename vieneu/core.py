@@ -120,6 +120,7 @@ class VieNeuTTS:
 
         # HF tokenizer
         self.tokenizer = None
+        self._last_subtitle_segments: list[dict] = []
 
         # Load models
         if backbone_repo:
@@ -132,13 +133,7 @@ class VieNeuTTS:
         self._default_voice = None
         self._load_voices(backbone_repo, hf_token)
 
-        # Load watermarker (optional)
-        try:
-            import perth
-            self.watermarker = perth.PerthImplicitWatermarker()
-            print("   🔒 Audio watermarking initialized (Perth)")
-        except (ImportError, AttributeError):
-            self.watermarker = None
+        self.watermarker = None
     
     def __enter__(self):
         return self
@@ -188,16 +183,97 @@ class VieNeuTTS:
             # Silence all exit errors as we are shutting down anyway
             pass
 
-    def save(self, audio, output_path: str):
+    def _format_srt_timestamp(self, seconds: float) -> str:
+        """Convert seconds to SRT timestamp format HH:MM:SS,mmm."""
+        total_ms = max(0, int(round(seconds * 1000.0)))
+        hours, rem = divmod(total_ms, 3_600_000)
+        minutes, rem = divmod(rem, 60_000)
+        secs, millis = divmod(rem, 1000)
+        return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+    def _build_subtitle_segments(
+        self,
+        chunks: list[str],
+        chunk_wavs: list[np.ndarray],
+        silence_p: float,
+        crossfade_p: float,
+    ) -> list[dict]:
+        """
+        Build subtitle segments from text chunks and per-chunk waveforms.
+        Timing mirrors join_audio_chunks behavior.
+        """
+        if not chunks or not chunk_wavs:
+            return []
+
+        segments = []
+        cursor = 0.0
+        chunk_count = min(len(chunks), len(chunk_wavs))
+
+        for idx in range(chunk_count):
+            chunk_text = chunks[idx].strip()
+            if not chunk_text:
+                continue
+
+            curr_duration = len(chunk_wavs[idx]) / float(self.sample_rate)
+            start = max(0.0, cursor)
+            end = max(start, start + curr_duration)
+            segments.append({"start": start, "end": end, "text": chunk_text})
+
+            if idx == chunk_count - 1:
+                cursor = end
+                continue
+
+            next_duration = len(chunk_wavs[idx + 1]) / float(self.sample_rate)
+            if silence_p > 0:
+                cursor = end + silence_p
+            elif crossfade_p > 0:
+                overlap = min(crossfade_p, curr_duration, next_duration)
+                cursor = end - overlap
+            else:
+                cursor = end
+
+        return segments
+
+    def _write_srt_file(self, srt_path: str | Path, segments: list[dict]):
+        """Write subtitle segments to .srt file."""
+        srt_path = Path(srt_path)
+        srt_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with srt_path.open("w", encoding="utf-8") as f:
+            for idx, seg in enumerate(segments, start=1):
+                start = self._format_srt_timestamp(seg["start"])
+                end = self._format_srt_timestamp(seg["end"])
+                text = seg["text"]
+                f.write(f"{idx}\n{start} --> {end}\n{text}\n\n")
+
+    def get_last_subtitle_segments(self) -> list[dict]:
+        """Get subtitle segments generated in the latest infer() call."""
+        return [dict(seg) for seg in self._last_subtitle_segments]
+
+    def save(
+        self,
+        audio,
+        output_path: str,
+        save_srt: bool = False,
+    ):
         """
         Save audio to file.
         
         Args:
             audio: Audio waveform
             output_path: Path to save the audio file
+            save_srt: Also save subtitle file from the latest infer() call.
         """
         import soundfile as sf
         sf.write(output_path, audio, self.sample_rate)
+        if save_srt:
+            segments = self.get_last_subtitle_segments()
+            if not segments:
+                raise ValueError(
+                    "No subtitle segments available. Run infer() first to generate chunk timings."
+                )
+            target_srt = str(Path(output_path).with_suffix(".srt"))
+            self._write_srt_file(target_srt, segments)
 
     def _load_backbone(self, backbone_repo, backbone_device, hf_token=None):
         # MPS device validation
@@ -511,6 +587,7 @@ class VieNeuTTS:
         chunks = split_text_into_chunks(text, max_chars=max_chars)
         
         if not chunks:
+            self._last_subtitle_segments = []
             return np.array([], dtype=np.float32)
 
         all_wavs = []
@@ -528,6 +605,12 @@ class VieNeuTTS:
 
         # Join all chunks with optional padding/crossfade
         final_wav = join_audio_chunks(all_wavs, self.sample_rate, silence_p, crossfade_p)
+        self._last_subtitle_segments = self._build_subtitle_segments(
+            chunks=chunks,
+            chunk_wavs=all_wavs,
+            silence_p=silence_p,
+            crossfade_p=crossfade_p,
+        )
 
         # Apply watermark if available
         if self.watermarker:
@@ -850,13 +933,7 @@ class FastVieNeuTTS:
         # 1. Load model-specific voices (Strict Mode)
         self._load_voices(backbone_repo, hf_token)
 
-        # Load watermarker (optional)
-        try:
-            import perth
-            self.watermarker = perth.PerthImplicitWatermarker()
-            print("   🔒 Audio watermarking initialized (Perth)")
-        except (ImportError, AttributeError):
-            self.watermarker = None
+        self.watermarker = None
 
         self._warmup_model()
         
@@ -1197,6 +1274,7 @@ class FastVieNeuTTS:
         chunks = split_text_into_chunks(text, max_chars=max_chars)
         
         if not chunks:
+            self._last_subtitle_segments = []
             return np.array([], dtype=np.float32)
             
         pd = {**base_phoneme_dict, **phoneme_dict} if phoneme_dict else base_phoneme_dict
@@ -1210,10 +1288,19 @@ class FastVieNeuTTS:
             prompt = self._format_prompt(ref_codes, ref_text, chunks[0], phoneme_dict=pd)
             responses = self.backbone([prompt], gen_config=self.gen_config, do_preprocess=False)
             wav = self._decode(responses[0].text)
+            chunk_wavs = [wav]
         else:
             # Multiple chunks: use batching for parallel generation
             all_wavs = self.infer_batch(chunks, ref_codes, ref_text, voice=voice, temperature=temperature, top_k=top_k, phoneme_dict=phoneme_dict)
             wav = join_audio_chunks(all_wavs, self.sample_rate, silence_p, crossfade_p)
+            chunk_wavs = all_wavs
+
+        self._last_subtitle_segments = self._build_subtitle_segments(
+            chunks=chunks,
+            chunk_wavs=chunk_wavs,
+            silence_p=silence_p,
+            crossfade_p=crossfade_p,
+        )
 
         # Apply watermark if available
         if self.watermarker:
@@ -1538,10 +1625,12 @@ class RemoteVieNeuTTS(VieNeuTTS):
         chunks = split_text_into_chunks(text, max_chars=max_chars)
         
         if not chunks:
+            self._last_subtitle_segments = []
             return np.array([], dtype=np.float32)
 
         pd = {**base_phoneme_dict, **phoneme_dict} if phoneme_dict else base_phoneme_dict
         all_wavs = []
+        generated_chunks = []
         for chunk in chunks:
             if isinstance(ref_codes, torch.Tensor):
                 ref_codes_list = ref_codes.cpu().numpy().flatten().tolist()
@@ -1573,12 +1662,19 @@ class RemoteVieNeuTTS(VieNeuTTS):
                 # Local decode is extremely fast
                 wav = self._decode(output_str)
                 all_wavs.append(wav)
+                generated_chunks.append(chunk)
             except Exception as e:
                 print(f"Error during remote inference: {e}")
                 continue
 
         # Join all chunks with optional padding/crossfade
         final_wav = join_audio_chunks(all_wavs, self.sample_rate, silence_p, crossfade_p)
+        self._last_subtitle_segments = self._build_subtitle_segments(
+            chunks=generated_chunks,
+            chunk_wavs=all_wavs,
+            silence_p=silence_p,
+            crossfade_p=crossfade_p,
+        )
 
         if self.watermarker:
             final_wav = self.watermarker.apply_watermark(final_wav, sample_rate=self.sample_rate)
