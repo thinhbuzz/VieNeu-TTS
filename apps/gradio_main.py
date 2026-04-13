@@ -9,6 +9,8 @@ import time
 import numpy as np
 import queue
 import threading
+from typing import Optional
+import shutil
 import yaml
 from vieneu_utils.core_utils import split_text_into_chunks, join_audio_chunks, env_bool, split_into_chunks_v2, get_silence_duration_v2
 from vieneu_utils.phonemize_text import phonemize_with_dict
@@ -207,6 +209,45 @@ def cleanup_gpu_memory():
         elif torch.backends.mps.is_available():
             torch.mps.empty_cache()
     gc.collect()
+
+def copy_output_if_configured(src_path: str, output_file_name: Optional[str] = None) -> Optional[str]:
+    """Copy output wav to GRADIO_OUTPUT_DIR if configured."""
+    output_dir = os.getenv("GRADIO_OUTPUT_DIR")
+    if not output_dir:
+        return None
+    output_dir = os.path.expanduser(output_dir)
+    os.makedirs(output_dir, exist_ok=True)
+
+    if output_file_name and output_file_name.strip():
+        raw_name = output_file_name.strip()
+        if os.path.isabs(raw_name):
+            raw_name = os.path.basename(raw_name)
+        safe_rel = os.path.normpath(raw_name).lstrip("\\/")
+        if safe_rel in (".", "") or safe_rel.startswith("..") or safe_rel.startswith("../") or safe_rel.startswith("..\\"):
+            safe_rel = os.path.basename(src_path)
+        name, ext = os.path.splitext(os.path.basename(safe_rel))
+        if not ext:
+            safe_rel = f"{safe_rel}.wav"
+        elif ext.lower() != ".wav":
+            safe_rel = os.path.join(os.path.dirname(safe_rel), f"{name}.wav")
+        dest_path = os.path.join(output_dir, safe_rel)
+    else:
+        base_name = os.path.basename(src_path)
+        dest_path = os.path.join(output_dir, base_name)
+
+    if os.path.abspath(src_path) == os.path.abspath(dest_path):
+        return dest_path
+
+    dest_parent = os.path.dirname(dest_path)
+    if dest_parent:
+        os.makedirs(dest_parent, exist_ok=True)
+
+    try:
+        shutil.copy2(src_path, dest_path)
+        return dest_path
+    except Exception as e:
+        print(f"⚠️ Không thể copy file output vào GRADIO_OUTPUT_DIR: {e}")
+        return None
 
 def load_model(backbone_choice: str, codec_choice: str, device_choice: str, 
                force_lmdeploy: bool, custom_model_id: str = "", custom_base_model: str = "", 
@@ -680,7 +721,7 @@ def load_model(backbone_choice: str, codec_choice: str, device_choice: str,
 
 def synthesize_speech(text: str, voice_choice: str, custom_audio, custom_text: str, 
                       mode_tab: str, generation_mode: str, use_batch: bool, max_batch_size_run: int,
-                      temperature: float, max_chars_chunk: int):
+                      temperature: float, max_chars_chunk: int, output_file_name: Optional[str] = None):
     """Synthesis with optimization support and max batch size control"""
     global tts, current_backbone, current_codec, model_loaded, using_lmdeploy
     
@@ -837,7 +878,9 @@ def synthesize_speech(text: str, voice_choice: str, custom_audio, custom_text: s
             with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
                 sf.write(tmp.name, final_wav, sr)
                 output_path = tmp.name
-            
+
+            copy_output_if_configured(output_path, output_file_name=output_file_name)
+
             process_time = time.time() - start_time
             backend_info = f" (Backend: {'LMDeploy 🚀' if using_lmdeploy else 'Standard 📦'})"
             speed_info = f", Tốc độ: {len(final_wav)/sr/process_time:.2f}x realtime" if process_time > 0 else ""
@@ -1008,13 +1051,16 @@ def synthesize_speech(text: str, voice_choice: str, custom_audio, custom_text: s
             final_wav = np.concatenate(full_audio_buffer)
             with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
                 sf.write(tmp.name, final_wav, sr)
-                
-                yield tmp.name, f"✅ Hoàn tất Streaming! ({backend_info})"
+                output_path = tmp.name
+
+            copy_output_if_configured(output_path, output_file_name=output_file_name)
+
+            yield output_path, f"✅ Hoàn tất Streaming! ({backend_info})"
             
             # Cleanup memory
             if using_lmdeploy and hasattr(tts, 'cleanup_memory'):
                 tts.cleanup_memory()
-            
+
             cleanup_gpu_memory()
 
 
@@ -1367,7 +1413,13 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
                 
                 # State to track current mode (replaces unreliable Textbox/Tabs input)
                 current_mode_state = gr.State("preset_mode")
-                
+
+                output_file_name_input = gr.Textbox(
+                    label="Output File Name",
+                    placeholder="Ví dụ: subfolder/name.wav (chỉ dùng khi GRADIO_OUTPUT_DIR được set)",
+                    info="Cho phép subfolder.",
+                )
+
                 with gr.Row():
                     btn_generate = gr.Button("🎵 Bắt đầu", variant="primary", scale=2, interactive=False)
                     btn_stop = gr.Button("⏹️ Dừng", variant="stop", scale=1, interactive=False)
@@ -1515,7 +1567,7 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
             fn=synthesize_speech,
             inputs=[text_input, voice_select, custom_audio, custom_text, current_mode_state, 
                     generation_mode, use_batch, max_batch_size_run,
-                    temperature_slider, max_chars_chunk_slider],
+                    temperature_slider, max_chars_chunk_slider, output_file_name_input],
             outputs=[audio_output, status_output]
         )
         
